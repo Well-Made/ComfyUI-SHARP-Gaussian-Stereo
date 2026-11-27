@@ -2,6 +2,7 @@
 
 | Component | Upstream | Version / revision | License / attribution |
 |---|---|---|---|
+| Direct upstream extension | https://github.com/Well-Made/ComfyUI-SHARP-Gaussian-Stereo | fork base; exact revision not recorded here | Original integration and viewer; GPL notices retained |
 | SHARP model architecture | https://github.com/PozzettiAndrea/ComfyUI-Sharp | commit `92c0015af61b71e6fd88301cfb336e7034f19796`; Apple-authored vendored model files | Apple Software License; Apple copyright notices retained |
 | SHARP model loader and inference integration | https://github.com/PozzettiAndrea/ComfyUI-Sharp | commit `92c0015af61b71e6fd88301cfb336e7034f19796` | GPL-3.0; adapted files identify provenance in module docstrings |
 | Original SHARP research code | https://github.com/apple-aiml-research/ml-sharp | upstream repository | Apple Software License; Apple acknowledgements retained |

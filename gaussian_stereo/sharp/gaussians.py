@@ -345,12 +345,12 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
 
 @torch.no_grad()
 def save_ply(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
-) -> tuple[None, dict]:
-    """Save a predicted Gaussian3D to a ply file.
+    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path | None
+) -> tuple[bytes | None, dict]:
+    """Serialize a predicted Gaussian3D as binary PLY (RAM if path is None).
 
     Returns:
-        tuple: (None, metadata_dict) where metadata_dict contains camera and scene info.
+        tuple: (PLY bytes if path is None, otherwise None, metadata_dict).
     """
 
     def _inverse_sigmoid(tensor: torch.Tensor) -> torch.Tensor:
@@ -409,9 +409,13 @@ def save_ply(
     header += "end_header\n"
 
     data = attributes.detach().cpu().to(torch.float32).contiguous().numpy()
-    with open(path, "wb") as f:
-        f.write(header.encode("ascii"))
-        data.tofile(f)
+    payload = None
+    if path is None:
+        payload = header.encode("ascii") + data.tobytes()
+    else:
+        with open(path, "wb") as f:
+            f.write(header.encode("ascii"))
+            data.tofile(f)
 
     # Build metadata dictionary
     image_height, image_width = image_shape
@@ -444,4 +448,4 @@ def save_ply(
         "version": [1, 5, 0],
     }
 
-    return None, metadata
+    return payload, metadata

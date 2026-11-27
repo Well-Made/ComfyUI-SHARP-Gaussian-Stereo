@@ -1,5 +1,5 @@
 /**
- * ComfyUI SHARP Gaussian Stereo Preview Widget
+ * ComfyUI SHARP VR Video Preview Widget
  * Interactive 3D Gaussian Splatting viewer using gsplat.js
  * Modified from PozzettiAndrea/comfy-3d-viewers for this standalone stereo node.
  */
@@ -10,17 +10,35 @@ import { app } from "../../../scripts/app.js";
 const EXTENSION_FOLDER = (() => {
     const url = import.meta.url;
     const match = url.match(/\/extensions\/([^/]+)\//);
-    return match ? match[1] : "ComfyUI-SHARP-Gaussian-Stereo";
+    return match ? match[1] : "ComfyUI-SHARP-VR-Video";
 })();
 
 console.log("[Gaussian Stereo] Loading extension...");
 
+const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=event-render-2`;
+function startSharedRenderer() {
+    // This belongs to the document, not to a graph or a DOM widget.
+    if (document.getElementById('sharp-vr-video-shared-renderer')) return;
+    const worker = document.createElement('iframe');
+    worker.id = 'sharp-vr-video-shared-renderer';
+    worker.title = 'SHARP shared batch renderer';
+    worker.setAttribute('aria-hidden', 'true');
+    worker.tabIndex = -1;
+    // Give the viewer a real layout size. Do not use display:none or detach it.
+    worker.style.cssText = 'position:fixed;left:0;top:0;width:768px;height:420px;border:0;opacity:0;pointer-events:none;z-index:-1;';
+    worker.src = workerUrl;
+    document.body.appendChild(worker);
+}
+
+
 app.registerExtension({
-    name: "comfyui.gaussianstereo",
+    name: "comfyui.sharpvrvideo",
+
+    async setup() { startSharedRenderer(); },
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         if (
-            nodeData.name === "SharpGaussianStereoPreview"
+            nodeData.name === "SharpVRVideoPreview"
         ) {
             console.log("[Gaussian Stereo] Registering Preview Gaussian node");
 
@@ -244,6 +262,55 @@ app.registerExtension({
                     }
                 };
 
+                return r;
+            };
+        }
+
+        if (nodeData.name === "SharpVRVideoBatch") {
+            const oldCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function() {
+                const r = oldCreated ? oldCreated.apply(this, arguments) : undefined;
+                // Presets are one-shot widget assignments, not backend constraints.
+                // Do not apply during creation/configuration: saved edits must survive reload.
+                const presetValues = {
+                    'Legacy / Viewer Controls': [30, 60, 2.5, 'Legacy / Toe-in'],
+                    'VR Life-size / Half Body': [35, 60, 2, 'Parallel off-axis'],
+                    'VR Life-size / Mixed Shots': [35, 60, 2.5, 'Parallel off-axis'],
+                    'VR Life-size / Full Body': [35, 60, 3.5, 'Parallel off-axis'],
+                    'VR 3D Cinema / Comfortable': [35, 35, 3, 'Parallel off-axis'],
+                    'VR 3D Cinema / Immersive': [35, 50, 3, 'Parallel off-axis'],
+                };
+                const presetWidget = this.widgets?.find(w => w.name === 'stereo_preset');
+                const applyPreset = (name) => {
+                    const values = presetValues[name];
+                    if (!values) return;
+                    const [focal, baseline, convergence, projection] = values;
+                    const settings = {focal_length_mm:focal, custom_baseline_mm:baseline,
+                        custom_convergence_m:convergence, projection_mode:projection,
+                        stereo_intensity:30, depth_scale:1, splat_size_scale:1};
+                    for (const [key, value] of Object.entries(settings)) {
+                        const w = this.widgets?.find(w => w.name === key);
+                        if (!w || w.type === 'converted-widget' || w.type === 'hidden' || w.type?.startsWith('converted-widget')) continue;
+                        w.value = value;
+                        w.callback?.call(w, value, app.canvas, this);
+                    }
+                    this.setDirtyCanvas?.(true, true);
+                };
+                if (presetWidget) {
+                    const originalCallback = presetWidget.callback;
+                    presetWidget.callback = function(value, ...args) {
+                        originalCallback?.call(this, value, ...args);
+                        applyPreset(value);
+                    };
+                }
+                // No node-owned iframe: switching graphs must not destroy the renderer.
+                const reload = this.addWidget('button', 'Reload selected preset', null, () => applyPreset(presetWidget?.value), {serialize:false});
+                if (reload) reload.serialize = false;
+                const open = this.addWidget('button', 'Open dedicated SHARP renderer', null, () => {
+                    window.open(workerUrl, 'sharp-vr-video-dedicated-renderer', 'noopener');
+                }, {serialize:false});
+                if (open) open.serialize = false;
+                this.setSize([520,400]);
                 return r;
             };
         }

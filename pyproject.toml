@@ -1,13 +1,13 @@
 [project]
-name = "sharp-gaussian-stereo"
-version = "1.0.0"
-description = "SHARP Gaussian Splatting stereo preview nodes for ComfyUI"
+name = "sharp-vr-video"
+version = "0.1.0"
+description = "Experimental SHARP Gaussian splat batch stereoscopic video conversion for ComfyUI"
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = ["huggingface_hub>=0.20.0", "tqdm"]
 
 [project.urls]
-Repository = "https://github.com/Well-Made/ComfyUI-SHARP-Gaussian-Stereo"
+Repository = "https://github.com/jerg-git/ComfyUI-SHARP-VR-Video"
 
 [tool.comfy]
-PublisherId = "well-made"
-DisplayName = "SHARP Gaussian Stereo Preview"
+PublisherId = "jerg-git"
+DisplayName = "SHARP VR Video"

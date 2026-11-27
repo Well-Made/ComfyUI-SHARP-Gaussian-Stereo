@@ -13,11 +13,11 @@ import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 
-log = logging.getLogger("sharp")
+log = logging.getLogger("sharp_vr_video")
 
 
 def _log(message: str) -> None:
-    print(f"[SHARP Gaussian Stereo] {message}", file=sys.stderr, flush=True)
+    print(f"[SHARP VR Video] {message}", file=sys.stderr, flush=True)
 
 
 try:
@@ -220,7 +220,7 @@ def _load_sharp_model(config):
     return _model_patcher
 
 
-class LoadSharpModel:
+class SharpVRVideoLoadModel:
     """Download/locate SHARP weights and emit a lightweight model config."""
 
     @classmethod
@@ -234,7 +234,7 @@ class LoadSharpModel:
             }
         }
 
-    RETURN_TYPES = ("SHARP_MODEL_CONFIG",)
+    RETURN_TYPES = ("SHARP_VR_VIDEO_MODEL_CONFIG",)
     RETURN_NAMES = ("model_config",)
     FUNCTION = "load_model"
     CATEGORY = "SHARP"

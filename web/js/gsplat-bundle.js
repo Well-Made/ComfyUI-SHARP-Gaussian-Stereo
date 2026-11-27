@@ -746,7 +746,7 @@ format binary_little_endian 1.0
   };
   var Rt = class {
     constructor() {
-      this._fx = 1132, this._fy = 1132, this._near = 0.1, this._far = 100, this._width = 512, this._height = 512, this._projectionMatrix = new K(), this._viewMatrix = new K(), this._viewProj = new K(), this._updateProjectionMatrix = () => {
+      this._fx = 1132, this._fy = 1132, this._shiftX = 0, this._near = 0.1, this._far = 100, this._width = 512, this._height = 512, this._projectionMatrix = new K(), this._viewMatrix = new K(), this._viewProj = new K(), this._updateProjectionMatrix = () => {
         this._projectionMatrix = new K(
           2 * this.fx / this.width,
           0,
@@ -756,7 +756,7 @@ format binary_little_endian 1.0
           -2 * this.fy / this.height,
           0,
           0,
-          0,
+          2 * this.fx * this._shiftX / this.width,
           0,
           this.far / (this.far - this.near),
           1,
@@ -788,6 +788,11 @@ format binary_little_endian 1.0
       }, this.setSize = (t, n) => {
         this._width = t, this._height = n, this._updateProjectionMatrix();
       };
+    }
+    // Normalized camera-space principal point shift (X/Z).
+    get shiftX() { return this._shiftX; }
+    set shiftX(t) {
+      this._shiftX !== t && (this._shiftX = t, this._updateProjectionMatrix());
     }
     get fx() {
       return this._fx;
@@ -1512,21 +1517,19 @@ format binary_little_endian 1.0
             U.colors,
             U.selection
           ), this._positions.set(U.worldPositions, U.offset * 3), this._rotations.set(U.worldRotations, U.offset * 4), this._scales.set(U.worldScales, U.offset * 3), this._updating.delete(F), F.selectedChanged = false, this.dataChanged = true;
+          if (window.__sharpBatchEventRendering) window.dispatchEvent(new Event("sharp-render-progress"));
         }
       };
       let s;
-      async function r() {
-        s = await mt();
-      }
-      r();
-      async function Q() {
-        for (; !s; )
-          await new Promise((a) => setTimeout(a, 0));
-      }
+      this._initialPacking = new Set();
+      let disposed = false;
+      // This bundled Emscripten initializer returns a module synchronously.
+      const packingReady = Promise.resolve(mt()).then((module) => { s = module; });
       const I = (a) => {
         if (!s) {
-          Q().then(() => {
-            I(a);
+          this._initialPacking.add(a);
+          packingReady.then(() => {
+            if (!disposed) I(a);
           });
           return;
         }
@@ -1557,6 +1560,8 @@ format binary_little_endian 1.0
         for (let M = 0; M < a.data.vertexCount; M++)
           this._transformIndices[L + M] = H;
         this._data.set(W, L * 8), this._positions.set(Z, L * 3), this._rotations.set(k, L * 4), this._scales.set(f, L * 3), s._free(U), s._free(F), s._free(g), s._free(B), s._free(C), s._free(c), s._free(p), s._free(u), s._free(S), this.dataChanged = true, this.colorTransformsChanged = true;
+        this._initialPacking.delete(a);
+        if (window.__sharpBatchEventRendering) window.dispatchEvent(new Event("sharp-render-progress"));
       }, d = (a) => {
         if ((a.positionChanged || a.rotationChanged || a.scaleChanged || a.selectedChanged) && A(a), a.colorTransformChanged && o(), !a.data.changed || a.data.detached) return;
         const U = {
@@ -1606,6 +1611,7 @@ format binary_little_endian 1.0
           d(a);
         this._dirty.clear();
       }, this.dispose = () => {
+        disposed = true;
         this._worker.terminate();
       };
       for (const a of this._splatIndices.keys())
@@ -1676,7 +1682,7 @@ format binary_little_endian 1.0
       return this._dirty.size > 0;
     }
     get updating() {
-      return this._updating.size > 0;
+      return this._updating.size > 0 || this._initialPacking.size > 0;
     }
   };
   var dt = class {
@@ -1861,6 +1867,7 @@ void main () {
           if (V.data.depthIndex) {
             const { depthIndex: w } = V.data;
             this._depthIndex = w, e.bindBuffer(e.ARRAY_BUFFER, Z), e.bufferData(e.ARRAY_BUFFER, w, e.STATIC_DRAW);
+            if (this.renderer._sharpBatch && window.__sharpBatchEventRendering) window.dispatchEvent(new Event("sharp-render-progress"));
           }
         };
       };
@@ -1887,7 +1894,7 @@ void main () {
         const w = V;
         w.object instanceof X && this._renderData && this._renderData.markDirty(w.object);
       }, M = () => {
-        this._renderData?.dispose(), this._renderData = new Ut(this._scene), this._worker?.terminate(), k();
+        this._renderData?.dispose(), this._renderData = new Ut(this._scene), this._worker?.terminate(), this._depthIndex = new Uint32Array(), k();
       };
       this._render = () => {
         if (!this._scene || !this._camera || !this.renderData) {
@@ -1946,6 +1953,12 @@ void main () {
             e.UNSIGNED_INT,
             this.renderData.colorTransformIndices
           ));
+          // Batch captures must not reuse a sort result from older geometry.
+          if (this.renderer._sharpBatch) {
+            this._worker?.terminate();
+            this._depthIndex = new Uint32Array();
+            k();
+          }
           const V = new Float32Array(this.renderData.positions.slice().buffer), w = new Float32Array(this.renderData.transforms.slice().buffer), P = new Uint32Array(this.renderData.transformIndices.slice().buffer);
           this._worker?.postMessage(
             {

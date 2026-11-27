@@ -19,7 +19,7 @@ from .sharp.model import MonodepthOutput
 from .sharp_model import _load_sharp_model
 from .utils.image import convert_focallength
 
-log = logging.getLogger("sharp")
+log = logging.getLogger("sharp_vr_video")
 _encode_cache = {
     "image_hash": None,
     "monodepth_output": None,
@@ -38,9 +38,10 @@ def _monodepth_to(output, device):
     )
 
 
-def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intrinsics=None):
+def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intrinsics=None, *, quiet=False):
     import comfy.model_management
 
+    report = log.debug if quiet else log.info
     internal_shape = (1536, 1536)
     memory_required = patcher.memory_required([1, 3, internal_shape[0], internal_shape[1]])
     comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
@@ -69,7 +70,7 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
         ).to(dtype=model_dtype)
         started = time.time()
         monodepth_output, _ = predictor.encode(image_resized)
-        log.info("SHARP encode completed in %.2fs", time.time() - started)
+        report("SHARP encode completed in %.2fs", time.time() - started)
         _encode_cache["image_hash"] = image_hash
         _encode_cache["patcher_id"] = patcher_id
         _encode_cache["monodepth_output"] = _monodepth_to(monodepth_output, "cpu")
@@ -81,7 +82,7 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
     )
     started = time.time()
     gaussians_ndc = predictor.decode(monodepth_output, image_resized, disparity_factor)
-    log.info("SHARP decode completed in %.2fs", time.time() - started)
+    report("SHARP decode completed in %.2fs", time.time() - started)
 
     if intrinsics is not None:
         unproj_intrinsics = intrinsics.clone()
@@ -102,13 +103,13 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
 
 @torch.no_grad()
 def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
-                        extrinsics=None, intrinsics=None):
+                        extrinsics=None, intrinsics=None, *, quiet=False):
     import comfy.model_management
 
     if not isinstance(model_config, dict):
-        raise TypeError("SHARP model input is invalid. Connect (Down)Load SHARP Model.")
+        raise TypeError("SHARP model input is invalid. Connect SHARP VR Video Model Loader.")
     if image.dim() != 4 or image.shape[0] != 1:
-        raise ValueError("SHARP Gaussian Stereo Preview expects one IMAGE with shape [1,H,W,C].")
+        raise ValueError("SHARP VR Video Preview expects one IMAGE with shape [1,H,W,C].")
 
     patcher = _load_sharp_model(model_config)
     device = patcher.load_device
@@ -144,15 +145,23 @@ def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
         img_extrinsics = None
         img_intrinsics = None
 
-    log.info("Running SHARP inference for %dx%d image", width, height)
+    report = log.debug if quiet else log.info
+    report("Running SHARP inference for %dx%d image", width, height)
     gaussians = _predict_image_cached(
         patcher, image_np, f_px, device,
-        extrinsics=img_extrinsics, intrinsics=img_intrinsics,
+        extrinsics=img_extrinsics, intrinsics=img_intrinsics, quiet=quiet,
     )
 
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    output_path = Path(output_dir) / f"gaussian_stereo_{int(time.time() * 1000)}.ply"
-    _, metadata = save_ply(gaussians, f_px, (height, width), output_path)
-    log.info("Saved SHARP PLY: %s (%s gaussians)", output_path, f"{metadata['num_gaussians']:,}")
+    # Batch rendering requests an in-memory PLY; single-image previews retain file export.
+    output_path = None
+    if output_dir is not None:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        output_path = Path(output_dir) / f"sharp_vr_video_{int(time.time() * 1000)}.ply"
+    payload, metadata = save_ply(gaussians, f_px, (height, width), output_path)
+    if output_path is None:
+        report("SHARP PLY in RAM: %.1f MiB (%s gaussians)", len(payload) / 1048576,
+                 f"{metadata['num_gaussians']:,}")
+    else:
+        report("Saved SHARP PLY: %s (%s gaussians)", output_path, f"{metadata['num_gaussians']:,}")
     comfy.model_management.soft_empty_cache()
-    return str(output_path), metadata["extrinsic"], metadata["intrinsic"]
+    return (payload if output_path is None else str(output_path)), metadata["extrinsic"], metadata["intrinsic"]

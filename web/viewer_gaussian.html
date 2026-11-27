@@ -4,7 +4,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SHARP Gaussian Stereo Preview</title>
+    <title>SHARP VR Video Preview</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -144,6 +144,7 @@
     </div>
 
     <div id="controlsBar">
+        <div id="batchPresetStatus" class="control-row" style="display:none; font-size:11px; color:#ddd; padding:4px 0;"></div>
         <div class="control-row">
             <div class="control-group view-mode-control">
                 <label for="viewMode">Enable Stereo Preview</label>
@@ -205,11 +206,15 @@
     </div>
 
     <!-- Load bundled gsplat.js -->
-    <script src="./js/gsplat-bundle.js"></script>
+    <script src="./js/gsplat-bundle.js?v=event-render-2"></script>
 
     <script type="module">
         // Use the globally exported GSPLAT
         const SPLAT = window.GSPLAT;
+        const params = new URLSearchParams(location.search);
+        const isBatchViewer = params.get("batch") === "1";
+        const isSharedWorker = isBatchViewer && params.get("worker") === "1";
+        window.__sharpBatchEventRendering = isBatchViewer;
 
         // DOM elements
         const canvas = document.getElementById('canvasLeft');
@@ -225,7 +230,7 @@
         const errorEl = document.getElementById('error');
         const backgroundColorInput = document.getElementById('backgroundColorInput');
         const DEFAULT_BACKGROUND_COLOR = '#000000';
-        const BACKGROUND_COLOR_STORAGE_KEY = 'comfyui-sharp-gaussian-stereo.backgroundColor';
+        const BACKGROUND_COLOR_STORAGE_KEY = 'comfyui-sharp-vr-video.backgroundColor';
         let currentBackgroundColor = DEFAULT_BACKGROUND_COLOR;
 
         function setBackgroundColor(value, persist = true) {
@@ -276,6 +281,8 @@
         // Smooth the stereo baseline response while keeping the slider's exact target value.
         let smoothedStereoIntensity = Number(stereoSlider.value) || 0;
         let lastStereoUpdateTime = 0;
+        // Set by the Python batch job, not by mutable viewer controls.
+        let batchStereo = null;
         let animationId = null;
         let currentSplat = null;
         let currentSplatRight = null;
@@ -362,8 +369,9 @@
                 camera = new SPLAT.Camera();
                 cameraLeft = new SPLAT.Camera();
                 cameraRight = new SPLAT.Camera();
-                renderer = new SPLAT.WebGLRenderer(canvas);
-                rendererRight = new SPLAT.WebGLRenderer(canvasRight);
+                renderer = new SPLAT.WebGLRenderer(canvas, isBatchViewer ? [] : null);
+                rendererRight = new SPLAT.WebGLRenderer(canvasRight, isBatchViewer ? [] : null);
+                renderer._sharpBatch = rendererRight._sharpBatch = isBatchViewer;
                 // WebGLRenderer sets canvas.style.background to black in its constructor.
                 // Reapply the user's persisted color after both renderers exist.
                 canvas.style.backgroundColor = currentBackgroundColor;
@@ -424,9 +432,15 @@
                     }
                     animationId = requestAnimationFrame(frame);
                 };
-                frame();
+                if (!isSharedWorker) frame();
 
                 console.log('[GaussianViewer] Initialized successfully');
+                if (isSharedWorker) {
+                    // Rendering is job-driven, never dependent on requestAnimationFrame.
+                    viewerContainer.style.pointerEvents = 'none';
+                    document.getElementById('controlsBar').style.pointerEvents = 'none';
+                    startSharedWorker();
+                } else if (isBatchViewer) window.parent.postMessage({type:"BATCH_VIEWER_READY"}, location.origin);
             } catch (err) {
                 console.error('[GaussianViewer] Init error:', err);
                 showError('Failed to initialize WebGL viewer: ' + err.message);
@@ -475,6 +489,12 @@
             const mode = stereoMode.value;
 
             stereoValue.textContent = `${targetIntensity > 0 ? '+' : ''}${targetIntensity}%`;
+            const fixedStereo = isBatchViewer && batchStereo?.mode === 'fixed';
+            // Always clear any previous off-axis shift when switching to legacy/mono.
+            if (!fixedStereo || !isStereoEnabled()) {
+                cameraLeft.data.shiftX = cameraRight.data.shiftX = 0;
+            }
+            if (fixedStereo) stereoValue.textContent = `${(batchStereo.baseline_m * 1000).toFixed(0)} mm`;
 
             if (!isStereoEnabled()) {
                 // Mono uses the master camera pose directly: no stereo offset and
@@ -499,7 +519,7 @@
 
             // Signed baseline: crossing zero makes the two eye cameras pass
             // through one another without swapping panes or canvas assignments.
-            const baseline = distance * 0.12 * signedIntensity;
+            const baseline = fixedStereo ? batchStereo.baseline_m : distance * 0.12 * signedIntensity;
             const worldRight = camera.rotation.apply(new SPLAT.Vector3(1, 0, 0));
             const halfOffset = worldRight.multiply(baseline * 0.5);
 
@@ -512,8 +532,12 @@
                 const eyePosition = camera.position.add(halfOffset.multiply(sign));
                 eyeCamera.position = eyePosition;
 
-                if (mode === 'toe-in') {
-                    const direction = convergenceTarget.clone()
+                const fixedToeIn = fixedStereo && batchStereo.projection === 'Toe-in' && batchStereo.convergence_m > 0;
+                if (fixedToeIn || (!fixedStereo && mode === 'toe-in')) {
+                    const toeTarget = fixedToeIn ? camera.position.add(
+                        camera.rotation.apply(new SPLAT.Vector3(0, 0, 1)).multiply(batchStereo.convergence_m)
+                    ) : convergenceTarget;
+                    const direction = toeTarget.clone()
                         .subtract(eyePosition)
                         .normalize();
                     eyeCamera.rotation = SPLAT.Quaternion.LookRotation(direction);
@@ -525,6 +549,10 @@
                 eyeCamera.data.fy = camera.data.fy;
                 eyeCamera.data.near = camera.data.near;
                 eyeCamera.data.far = camera.data.far;
+                // At Z=convergence_m the camera translation is canceled by
+                // the principal-point shift. No toe-in or vertical disparity.
+                eyeCamera.data.shiftX = fixedStereo && batchStereo.projection === 'Parallel off-axis' && batchStereo.convergence_m > 0
+                    ? sign * baseline / (2 * batchStereo.convergence_m) : 0;
             };
 
             copyPose(cameraLeft, -1);
@@ -993,7 +1021,7 @@
             }
         }
 
-        async function loadPLYFromURL(url, filename, extrinsics, intrinsics) {
+        async function loadPLYFromURL(url, filename, extrinsics, intrinsics, batch = false) {
             try {
                 // Reset per-model adjustment snapshots.
                 originalPositions = null;
@@ -1103,10 +1131,12 @@
                 }, '*');
 
                 console.log('[GaussianViewer] Loaded successfully from URL');
+                if (batch && (!currentSplat || !currentSplatRight)) throw new Error('PLY contains no splats');
 
             } catch (err) {
                 console.error('[GaussianViewer] Load error:', err);
                 showError('Failed to load PLY: ' + err.message);
+                if (batch) throw err;
 
                 window.parent.postMessage({
                     type: 'MESH_ERROR',
@@ -1632,6 +1662,149 @@
         viewMode.addEventListener('change', updateViewMode);
         updateViewMode();
 
+        // PLY parsing is not the same as GPU readiness: wait for both gsplat
+        // packing/sorting workers to return indices before capturing the canvases.
+        let batchBusy = false;
+        function configureBatchStereo(stereo) {
+            batchStereo = stereo || null;
+            const fixed = batchStereo?.mode === 'fixed';
+            const status = document.getElementById('batchPresetStatus');
+            status.style.display = 'flex';
+            status.textContent = !batchStereo ? 'Viewer controls' : fixed
+                ? `${batchStereo.projection} | ${(batchStereo.baseline_m * 1000).toFixed(1)} mm | Convergence: ${batchStereo.convergence_m || 'infinity'}${batchStereo.convergence_m ? ' m' : ''}`
+                : `${batchStereo.projection} | ${batchStereo.intensity}%`;
+            // The batch node's editable widgets are authoritative; do not let
+            // transient iframe controls override queued workflow settings.
+            for (const input of [stereoSlider, stereoMode, viewMode, depthScaleInput, scaleInput, document.getElementById('resetDepthScale')]) {
+                input.disabled = !!batchStereo;
+            }
+            if (batchStereo) {
+                stereoMode.value = batchStereo.projection.endsWith('Toe-in') ? 'toe-in' : 'parallel';
+                stereoSlider.value = batchStereo.intensity;
+            }
+        }
+        function applyBatchGeometrySettings() {
+            if (!batchStereo) return;
+            currentDepthScale = batchStereo.depth_scale;
+            currentScale = batchStereo.splat_scale;
+            depthScaleInput.value = currentDepthScale;
+            depthScaleValue.textContent = currentDepthScale.toFixed(2) + '×';
+            scaleInput.value = currentScale;
+            if (currentDepthScale !== 1 || currentScale !== 1) {
+                pendingLeftAdjustment = pendingRightAdjustment = true;
+                applyPendingSplatAdjustments();
+            }
+        }
+        async function captureBatchFrame(job) {
+            let result;
+            const reply = (data) => {
+                result = data;
+                if (!isSharedWorker) window.parent.postMessage({type:'BATCH_FRAME_CAPTURED', id:job.id, ...data}, location.origin);
+            };
+            if (batchBusy) { reply({error:'Viewer is already rendering another frame'}); return result; }
+            batchBusy = true;
+            const deadline = performance.now() + Math.max(1000, (job.timeout - 3) * 1000);
+            try {
+                if (!renderer || !rendererRight) throw new Error('WebGL viewer is not initialized');
+                configureBatchStereo(job.stereo);
+                // Do not allow orbit or adjustment gestures during capture.
+                viewerContainer.style.pointerEvents = 'none';
+                document.getElementById('controlsBar').style.pointerEvents = 'none';
+                viewMode.checked = true;
+                updateViewMode();
+                smoothedStereoIntensity = Number(stereoSlider.value) || 0;
+                await loadPLYFromURL(job.url, job.filename, job.extrinsics, job.intrinsics, true);
+                // Loading resets the multipliers: reapply immediately, every frame.
+                applyBatchGeometrySettings();
+                const ready = (r) => {
+                    const p = r.renderProgram;
+                    const d = p?.renderData;
+                    return d && d.vertexCount > 0 && !d.updating && !d.needsRebuild &&
+                        !d.dataChanged && p.depthIndex?.length === d.vertexCount;
+                };
+                // Wake when packing/sorting actually finishes. The timer is
+                // only a watchdog for unexpected lost messages/context loss.
+                while (true) {
+                    if (performance.now() >= deadline) throw new Error('Timed out waiting for both Gaussian sorting workers');
+                    if (renderer.gl.isContextLost() || rendererRight.gl.isContextLost()) throw new Error('WebGL context lost');
+                    let wake, timer;
+                    const event = new Promise(resolve => { wake = resolve; });
+                    window.addEventListener('sharp-render-progress', wake);
+                    try {
+                        renderStereoNow();
+                        if (!pendingLeftAdjustment && !pendingRightAdjustment && ready(renderer) && ready(rendererRight)) break;
+                        timer = setTimeout(wake, 1000);
+                        await event;
+                    } finally {
+                        clearTimeout(timer);
+                        window.removeEventListener('sharp-render-progress', wake);
+                    }
+                }
+                // Draw with the now-current focal uniforms and sorted indices.
+                renderStereoNow();
+                const finalCanvas = composeStereoCanvas();
+                reply({image:finalCanvas.toDataURL('image/png')});
+            } catch (err) { reply({error:String(err.message || err)}); }
+            finally {
+                batchBusy = false;
+                if (!isSharedWorker) {
+                    viewerContainer.style.pointerEvents = '';
+                    document.getElementById('controlsBar').style.pointerEvents = '';
+                    if (renderer && rendererRight) {
+                        if (animationId) cancelAnimationFrame(animationId);
+                        resumeAnimationLoop();
+                    }
+                }
+            }
+            return result;
+        }
+
+        // Shared workers claim queued frames atomically on the Python server.
+        // Each worker processes only one frame at a time, regardless of graph ID.
+        function startSharedWorker() {
+            const status = document.createElement('div');
+            status.style.cssText = 'padding:6px 10px;background:#222;color:#ddd;font:12px sans-serif;flex:none;';
+            document.body.prepend(status);
+            const setStatus = (text) => { status.textContent = 'SHARP renderer: ' + text; document.title = 'SHARP renderer - ' + text; };
+            setStatus('Ready / waiting for frames');
+            let stopped = false;
+            window.addEventListener('pagehide', () => { stopped = true; });
+            window.addEventListener('pageshow', (event) => { if (event.persisted && stopped) { stopped = false; poll(); } });
+            async function poll() {
+                if (stopped) return;
+                try {
+                    const endpoint = '/sharp_vr_video_batch/next?worker=1&wait=1' + (window.parent === window ? '&dedicated=1' : '');
+                    const response = await fetch(endpoint, {cache:'no-store'});
+                    if (!response.ok) throw new Error('Polling HTTP ' + response.status);
+                    const {job} = await response.json();
+                    if (job) {
+                        setStatus('Rendering frame');
+                        let output;
+                        try {
+                            const result = await captureBatchFrame(job);
+                            if (result?.error) throw new Error(result.error);
+                            if (!result?.image?.startsWith('data:image/png;base64,')) throw new Error('No PNG returned');
+                            output = {png:result.image.split(',')[1]};
+                        } catch (error) { output = {error:String(error.message || error)}; }
+                        const done = await fetch('/sharp_vr_video_batch/complete', {
+                            method:'POST', headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify({id:job.id,...output})
+                        });
+                        if (!done.ok && done.status !== 404) throw new Error('Capture upload HTTP ' + done.status);
+                        setStatus(output.error ? 'Frame error: ' + output.error : 'Ready / waiting for frames');
+                    }
+                } catch (error) {
+                    console.error('[SHARP worker]',error);
+                    setStatus('Connection error; retrying');
+                    if (!stopped) setTimeout(poll, 1000);
+                    return;
+                }
+                // Each HTTP response wakes the renderer without a browser timer.
+                if (!stopped) poll();
+            }
+            poll();
+        }
+
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
             const { type, data, url, filename, extrinsics, intrinsics } = event.data;
@@ -1639,6 +1812,8 @@
             if (type === 'LOAD_MESH_URL' && url) {
                 console.log('[GaussianViewer] Received LOAD_MESH_URL:', url);
                 loadPLYFromURL(url, filename || 'gaussian.ply', extrinsics, intrinsics);
+            } else if (type === 'RENDER_BATCH_FRAME' && isBatchViewer && !isSharedWorker && event.source === window.parent && event.origin === location.origin) {
+                captureBatchFrame(event.data);
             } else if (type === 'LOAD_MESH_DATA' && data) {
                 console.log('[GaussianViewer] Received LOAD_MESH_DATA, size:', data.byteLength);
                 loadPLYFromData(data, filename || 'gaussian.ply', extrinsics, intrinsics);
