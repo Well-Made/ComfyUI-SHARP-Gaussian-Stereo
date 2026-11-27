@@ -1,6 +1,0 @@
-The Gaussian viewer files are derived from PozzettiAndrea/comfy-3d-viewers,
-which declares GPL-3.0-or-later in its pyproject.toml. The applicable GPL-3.0
-license text is included at the repository root in LICENSE.
-
-Upstream: https://github.com/PozzettiAndrea/comfy-3d-viewers
-The viewer files in this repository contain project-specific modifications.
