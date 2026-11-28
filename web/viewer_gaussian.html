@@ -25,7 +25,7 @@
         }
         .stereo-pane {
             position: relative; flex: 1 1 50%; min-width: 0; min-height: 0;
-            overflow: hidden; background: var(--viewer-background-color, #000000);
+            overflow: hidden; background: var(--viewer-background-color, #1c1c1c);
         }
         canvas {
             display: block; position: absolute; left: 50%; top: 50%;
@@ -190,7 +190,7 @@
                 </div>
                 <div class="control-group background-color-control">
                     <label for="backgroundColorInput">Background color:</label>
-                    <input type="color" id="backgroundColorInput" value="#000000" title="Choose the background color for transparent areas">
+                    <input type="color" id="backgroundColorInput" value="#1c1c1c" title="Choose the background color for transparent areas">
                 </div>
             </div>
             <div class="advanced-control-row advanced-depth-row">
@@ -224,7 +224,7 @@
         const stereoPanes = document.getElementById('stereoPanes');
         const errorEl = document.getElementById('error');
         const backgroundColorInput = document.getElementById('backgroundColorInput');
-        const DEFAULT_BACKGROUND_COLOR = '#000000';
+        const DEFAULT_BACKGROUND_COLOR = '#1c1c1c';
         const BACKGROUND_COLOR_STORAGE_KEY = 'comfyui-sharp-gaussian-stereo.backgroundColor';
         let currentBackgroundColor = DEFAULT_BACKGROUND_COLOR;
 
@@ -277,6 +277,9 @@
         let smoothedStereoIntensity = Number(stereoSlider.value) || 0;
         let lastStereoUpdateTime = 0;
         let animationId = null;
+        // Renderer sort buffers before the next backend-triggered PLY load.
+        // The bundled gsplat renderer replaces depthIndex when its Worker finishes sorting.
+        let pendingRunSortBaseline = null;
         let currentSplat = null;
         let currentSplatRight = null;
         let originalScales = null;  // Left-eye baseline scales
@@ -811,6 +814,27 @@
             console.log('[GaussianViewer] This should match the original input image view');
         }
 
+        function getRendererSortState(activeRenderer) {
+            const program = activeRenderer?.renderProgram;
+            const renderData = program?.renderData;
+            return {
+                depthIndex: program?.depthIndex || null,
+                vertexCount: renderData?.vertexCount || 0,
+                updating: renderData?.updating ?? true,
+                needsRebuild: renderData?.needsRebuild ?? true,
+                dataChanged: renderData?.dataChanged ?? true,
+                transformsChanged: renderData?.transformsChanged ?? true,
+                colorTransformsChanged: renderData?.colorTransformsChanged ?? true
+            };
+        }
+
+        function snapshotRendererSortReferences() {
+            return {
+                left: getRendererSortState(renderer).depthIndex,
+                right: getRendererSortState(rendererRight).depthIndex
+            };
+        }
+
         // Load a PLY file from ArrayBuffer data
         async function loadPLYFromData(arrayBuffer, filename, extrinsics, intrinsics) {
             try {
@@ -1238,6 +1262,147 @@
             }
         }
 
+        function getCameraViewSignature(activeCamera) {
+            const matrix = activeCamera?.data?.viewProj?.buffer;
+            return matrix ? Array.from(matrix) : null;
+        }
+
+        function sameMatrix(a, b) {
+            if (!a || !b || a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) {
+                if (a[i] !== b[i]) return false;
+            }
+            return true;
+        }
+
+        // Wait for the new scene's Worker sort result and for the initial camera to settle.
+        // The baseline is captured before the PLY is loaded, so an old depthIndex with the
+        // same vertex count cannot be mistaken for the result of the current run.
+        async function waitForInitialRendererReady(sortBaseline, timeoutMs = 110000) {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+
+            return new Promise((resolve, reject) => {
+                const startedAt = performance.now();
+                let previousLeftMatrix = null;
+                let previousRightMatrix = null;
+                let stableCameraFrames = 0;
+                let previousLeftDepthIndex = null;
+                let previousRightDepthIndex = null;
+                let stableSortFrames = 0;
+
+                const checkFrame = () => {
+                    controls.update();
+                    syncStereoCameras();
+                    applyPendingSplatAdjustments();
+                    renderer.render(scene, cameraLeft);
+                    updateFocalUniform(renderer, cameraLeft);
+                    if (isStereoEnabled()) {
+                        rendererRight.render(sceneRight, cameraRight);
+                        updateFocalUniform(rendererRight, cameraRight);
+                    }
+
+                    const left = getRendererSortState(renderer);
+                    const right = isStereoEnabled() ? getRendererSortState(rendererRight) : null;
+                    const leftMatrix = getCameraViewSignature(cameraLeft);
+                    const rightMatrix = isStereoEnabled() ? getCameraViewSignature(cameraRight) : null;
+                    const cameraStable = sameMatrix(leftMatrix, previousLeftMatrix) &&
+                        (!isStereoEnabled() || sameMatrix(rightMatrix, previousRightMatrix));
+                    stableCameraFrames = cameraStable ? stableCameraFrames + 1 : 0;
+                    previousLeftMatrix = leftMatrix;
+                    previousRightMatrix = rightMatrix;
+
+                    const leftIsNew = !!left.depthIndex && left.depthIndex !== sortBaseline?.left;
+                    const leftReady = leftIsNew && left.vertexCount > 0 &&
+                        left.depthIndex.length === left.vertexCount &&
+                        !left.updating && !left.needsRebuild &&
+                        !left.dataChanged && !left.transformsChanged && !left.colorTransformsChanged;
+
+                    let rightReady = true;
+                    let rightDepthIndex = null;
+                    if (isStereoEnabled()) {
+                        const rightIsNew = !!right.depthIndex && right.depthIndex !== sortBaseline?.right;
+                        rightReady = rightIsNew && right.vertexCount > 0 &&
+                            right.depthIndex.length === right.vertexCount &&
+                            !right.updating && !right.needsRebuild &&
+                            !right.dataChanged && !right.transformsChanged && !right.colorTransformsChanged;
+                        rightDepthIndex = right.depthIndex;
+                    }
+
+                    const sortReady = leftReady && rightReady;
+                    if (sortReady && stableCameraFrames >= 3) {
+                        const sameSortBuffers = left.depthIndex === previousLeftDepthIndex &&
+                            (!isStereoEnabled() || rightDepthIndex === previousRightDepthIndex);
+                        stableSortFrames = sameSortBuffers ? stableSortFrames + 1 : 0;
+                        previousLeftDepthIndex = left.depthIndex;
+                        previousRightDepthIndex = rightDepthIndex;
+                    } else {
+                        stableSortFrames = 0;
+                        previousLeftDepthIndex = left.depthIndex;
+                        previousRightDepthIndex = rightDepthIndex;
+                    }
+
+                    if (sortReady && stableCameraFrames >= 3 && stableSortFrames >= 3) {
+                        // One additional frame lets the renderer consume the completed sort buffers.
+                        requestAnimationFrame(() => {
+                            controls.update();
+                            syncStereoCameras();
+                            applyPendingSplatAdjustments();
+                            renderer.render(scene, cameraLeft);
+                            updateFocalUniform(renderer, cameraLeft);
+                            if (isStereoEnabled()) {
+                                rendererRight.render(sceneRight, cameraRight);
+                                updateFocalUniform(rendererRight, cameraRight);
+                            }
+                            resolve();
+                        });
+                        return;
+                    }
+
+                    if (performance.now() - startedAt >= timeoutMs) {
+                        reject(new Error('Timed out waiting for the initial Gaussian sorting/rendering to finish.'));
+                        return;
+                    }
+                    requestAnimationFrame(checkFrame);
+                };
+
+                requestAnimationFrame(checkFrame);
+            });
+        }
+
+        // Capture the initial viewer composition for the current ComfyUI execution.
+        // This uses the same canvas composition as Save to Disk / Copy to Clipboard,
+        // but does not apply any later user interaction.
+        async function captureRunOutput(runId) {
+            if (!renderer || (isStereoEnabled() && !rendererRight)) return;
+            try {
+                await waitForInitialRendererReady(pendingRunSortBaseline);
+                pendingRunSortBaseline = null;
+                const finalCanvas = composeStereoCanvas();
+                const dataUrl = finalCanvas.toDataURL('image/png');
+                window.parent.postMessage({
+                    type: 'RUN_OUTPUT_CAPTURE',
+                    run_id: runId,
+                    image: dataUrl,
+                    width: finalCanvas.width,
+                    height: finalCanvas.height
+                }, '*');
+                console.log('[GaussianViewer] Initial run image captured:', finalCanvas.width, 'x', finalCanvas.height);
+            } catch (err) {
+                pendingRunSortBaseline = null;
+                console.error('[GaussianViewer] Initial run capture failed:', err);
+                window.parent.postMessage({
+                    type: 'RUN_OUTPUT_CAPTURE',
+                    run_id: runId,
+                    error: err.message
+                }, '*');
+            } finally {
+                resumeAnimationLoop();
+            }
+        }
+
         // Save the current mono view or stereo pair through the existing ComfyUI upload path.
         async function takeScreenshot() {
             if (!renderer || (isStereoEnabled() && !rendererRight)) return;
@@ -1634,14 +1799,18 @@
 
         // Listen for messages from parent
         window.addEventListener('message', (event) => {
-            const { type, data, url, filename, extrinsics, intrinsics } = event.data;
+            const { type, data, url, filename, extrinsics, intrinsics, run_id } = event.data;
 
             if (type === 'LOAD_MESH_URL' && url) {
                 console.log('[GaussianViewer] Received LOAD_MESH_URL:', url);
+                pendingRunSortBaseline = snapshotRendererSortReferences();
                 loadPLYFromURL(url, filename || 'gaussian.ply', extrinsics, intrinsics);
             } else if (type === 'LOAD_MESH_DATA' && data) {
                 console.log('[GaussianViewer] Received LOAD_MESH_DATA, size:', data.byteLength);
+                pendingRunSortBaseline = snapshotRendererSortReferences();
                 loadPLYFromData(data, filename || 'gaussian.ply', extrinsics, intrinsics);
+            } else if (type === 'CAPTURE_RUN_OUTPUT' && run_id) {
+                captureRunOutput(run_id);
             }
         });
 

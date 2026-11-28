@@ -5,6 +5,7 @@
  */
 
 import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
 
 // Auto-detect extension folder name (detects the installed custom-node folder)
 const EXTENSION_FOLDER = (() => {
@@ -83,14 +84,100 @@ app.registerExtension({
 
                 // Track iframe load state
                 let iframeLoaded = false;
+                let pendingCaptureRequest = null;
+                let pendingCaptureRunId = null;
+                let pendingCapturePlyPath = null;
+                let lastPreloadedPlyPath = null;
+
+                function makeViewUrl(filename) {
+                    const normalized = String(filename).replace(/\\/g, '/');
+                    const pathMatch = normalized.match(/(?:^|\/)(output|input|temp)\/(.+)$/);
+                    if (pathMatch) {
+                        const [, type, relPath] = pathMatch;
+                        const parts = relPath.split('/');
+                        const fname = parts.pop();
+                        const subfolder = parts.join('/');
+                        return `/view?filename=${encodeURIComponent(fname)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`;
+                    }
+                    const basename = normalized.split('/').pop();
+                    return `/view?filename=${encodeURIComponent(basename)}&type=output&subfolder=`;
+                }
+
+                function sendCaptureLoadRequest(request) {
+                    if (!iframeLoaded || !iframe.contentWindow) return;
+                    const filepath = makeViewUrl(request.ply_file);
+                    pendingCaptureRunId = request.run_id;
+                    pendingCapturePlyPath = request.ply_file;
+                    iframe.contentWindow.postMessage({
+                        type: 'LOAD_MESH_URL',
+                        url: filepath,
+                        filename: request.filename || request.ply_file,
+                        extrinsics: request.extrinsics || null,
+                        intrinsics: request.intrinsics || null,
+                        timestamp: Date.now()
+                    }, '*');
+                    pendingCaptureRequest = null;
+                }
+
                 iframe.addEventListener('load', () => {
                     iframeLoaded = true;
+                    if (pendingCaptureRequest) sendCaptureLoadRequest(pendingCaptureRequest);
                 });
+
+                // The backend emits this event after SHARP has written the PLY.
+                // Load it immediately so the viewer can capture its initial frame
+                // before the Python node returns its IMAGE output.
+                const captureRequestListener = (event) => {
+                    const request = event?.detail || event;
+                    if (!request || String(request.node_id) !== String(this.id)) return;
+                    pendingCaptureRequest = request;
+                    if (iframeLoaded) sendCaptureLoadRequest(request);
+                };
+                api.addEventListener('sharp_gaussian_capture_request', captureRequestListener);
+                this._sharpGaussianCaptureRequestListener = captureRequestListener;
+                const onRemoved = this.onRemoved;
+                this.onRemoved = function() {
+                    api.removeEventListener('sharp_gaussian_capture_request', captureRequestListener);
+                    onRemoved?.apply(this, arguments);
+                };
 
                 // Listen for messages from iframe
                 window.addEventListener('message', async (event) => {
                     // Ignore messages from other viewer iframes/nodes.
                     if (event.source !== iframe.contentWindow) return;
+
+                    // The backend-triggered PLY load is complete. Capture the initial
+                    // viewer composition before the node is allowed to finish.
+                    if (event.data?.type === 'MESH_LOADED' && pendingCaptureRunId) {
+                        iframe.contentWindow.postMessage({
+                            type: 'CAPTURE_RUN_OUTPUT',
+                            run_id: pendingCaptureRunId
+                        }, '*');
+                        return;
+                    }
+
+                    if (event.data?.type === 'RUN_OUTPUT_CAPTURE' && event.data.run_id && (event.data.image || event.data.error)) {
+                        const runId = event.data.run_id;
+                        lastPreloadedPlyPath = pendingCapturePlyPath;
+                        try {
+                            const response = await fetch(`/sharp_gaussian_stereo/capture?run_id=${encodeURIComponent(runId)}`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ image: event.data.image, error: event.data.error })
+                            });
+                            if (!response.ok) {
+                                const detail = await response.text();
+                                throw new Error(`Capture upload failed (${response.status}): ${detail}`);
+                            }
+                            pendingCapturePlyPath = null;
+                            pendingCaptureRunId = null;
+                            console.log('[Gaussian Stereo] Initial viewer image sent to ComfyUI');
+                        } catch (error) {
+                            lastPreloadedPlyPath = null;
+                            console.error('[Gaussian Stereo] Could not send initial viewer image:', error);
+                        }
+                        return;
+                    }
 
                     // Keep the user's current node width and adjust only its height.
                     // The iframe reports a target height that already includes its controls.
@@ -157,6 +244,15 @@ app.registerExtension({
                     // Handle error messages from iframe
                     else if (event.data.type === 'MESH_ERROR' && event.data.error) {
                         console.error('[Gaussian Stereo] Error from viewer:', event.data.error);
+                        if (pendingCaptureRunId) {
+                            const failedRunId = pendingCaptureRunId;
+                            pendingCaptureRunId = null;
+                            fetch(`/sharp_gaussian_stereo/capture?run_id=${encodeURIComponent(failedRunId)}`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ error: event.data.error })
+                            }).catch(error => console.error('[Gaussian Stereo] Could not report viewer load failure:', error));
+                        }
                         if (infoPanel) {
                             infoPanel.innerHTML = `<div style="color: #ff6b6b;">Error: ${event.data.error}</div>`;
                         }
@@ -203,24 +299,16 @@ app.registerExtension({
                             infoPanel.innerHTML = "";
                         }
 
-                        // ComfyUI serves files via /view API — parse type/subfolder/filename
-                        // Handles both absolute (/home/.../output/sub/file) and relative (output/sub/file) paths
-                        let filepath;
-                        const normalized = filename.replace(/\\/g, '/');
-                        const pathMatch = normalized.match(/(?:^|\/)(output|input|temp)\/(.+)$/);
-                        if (pathMatch) {
-                            const [, type, relPath] = pathMatch;
-                            const parts = relPath.split('/');
-                            const fname = parts.pop();
-                            const subfolder = parts.join('/');
-                            filepath = `/view?filename=${encodeURIComponent(fname)}&type=${type}&subfolder=${encodeURIComponent(subfolder)}`;
-                        } else {
-                            // Fallback: use just the basename
-                            const basename = normalized.split('/').pop();
-                            filepath = `/view?filename=${encodeURIComponent(basename)}&type=output&subfolder=`;
+                        // The backend-triggered load already populated the viewer
+                        // before the IMAGE output was returned. Avoid loading the same
+                        // PLY a second time when ComfyUI delivers the node UI payload.
+                        if (lastPreloadedPlyPath &&
+                            lastPreloadedPlyPath.replace(/\\/g, '/') === filename.replace(/\\/g, '/')) {
+                            lastPreloadedPlyPath = null;
+                            return;
                         }
 
-                        // Send URL to iframe — gsplat.js fetches directly with streaming
+                        const filepath = makeViewUrl(filename);
                         const sendUrl = () => {
                             if (!iframe.contentWindow) {
                                 console.error("[Gaussian Stereo] Iframe contentWindow not available");
@@ -236,11 +324,8 @@ app.registerExtension({
                             }, "*");
                         };
 
-                        if (iframeLoaded) {
-                            sendUrl();
-                        } else {
-                            setTimeout(sendUrl, 500);
-                        }
+                        if (iframeLoaded) sendUrl();
+                        else setTimeout(sendUrl, 500);
                     }
                 };
 
