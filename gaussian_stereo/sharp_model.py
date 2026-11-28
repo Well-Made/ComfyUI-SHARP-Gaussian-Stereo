@@ -4,6 +4,7 @@ Adapted from ComfyUI-Sharp (GPL-3.0), nodes/load_model.py.
 The Apple SHARP model implementation is vendored separately under sharp/.
 """
 
+import inspect
 import logging
 import os
 import sys
@@ -131,12 +132,29 @@ def ensure_checkpoint():
         _log(f"Using existing checkpoint: {path} ({os.path.getsize(path) / 1048576:.1f} MB)")
         return path
     _log(f"Downloading {SHARP_FILENAME} from {SHARP_REPO_ID} to {MODELS_DIR}")
-    path = _download_with_retry(
-        repo_id=SHARP_REPO_ID,
-        filename=SHARP_FILENAME,
-        local_dir=MODELS_DIR,
-        tqdm_class=_comfy_tqdm(),
-    )
+    download_kwargs = {
+        "repo_id": SHARP_REPO_ID,
+        "filename": SHARP_FILENAME,
+        "local_dir": MODELS_DIR,
+    }
+
+    # huggingface_hub versions differ: some expose tqdm_class on
+    # hf_hub_download(), while others removed that argument. Keep the
+    # ComfyUI progress integration where supported and otherwise let
+    # huggingface_hub use its own tqdm progress bar.
+    try:
+        supports_tqdm_class = "tqdm_class" in inspect.signature(
+            hf_hub_download
+        ).parameters
+    except (TypeError, ValueError):
+        supports_tqdm_class = False
+
+    if supports_tqdm_class:
+        download_kwargs["tqdm_class"] = _comfy_tqdm()
+    else:
+        _log("huggingface_hub does not support tqdm_class; using its default download progress")
+
+    path = _download_with_retry(**download_kwargs)
     _log(f"Checkpoint ready: {path} ({os.path.getsize(path) / 1048576:.1f} MB)")
     return path
 
