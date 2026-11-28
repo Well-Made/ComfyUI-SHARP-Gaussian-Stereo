@@ -1,6 +1,6 @@
 [project]
 name = "sharp-gaussian-stereo"
-version = "1.0.1"
+version = "1.0.2"
 description = "SHARP Gaussian Splatting stereo preview nodes for ComfyUI"
 license = { file = "LICENSE" }
 dependencies = []
