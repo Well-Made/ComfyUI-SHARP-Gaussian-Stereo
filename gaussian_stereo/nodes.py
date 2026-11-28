@@ -6,15 +6,77 @@ The camera inputs retain the established custom socket type names
 EXTRINSICS and INTRINSICS for workflow compatibility. They are not STRING inputs.
 """
 
+import base64
 import math
 from pathlib import Path
 import threading
+import uuid
+
+import numpy as np
+import torch
+from PIL import Image
+from io import BytesIO
+
+from aiohttp import web
+from server import PromptServer
 
 import folder_paths
 
 
 _TEMP_PLY_BY_NODE = {}
 _TEMP_PLY_LOCK = threading.Lock()
+_CAPTURE_LOCK = threading.Lock()
+_PENDING_CAPTURES = {}
+_CAPTURE_TIMEOUT_SECONDS = 120
+
+
+async def _receive_capture(request):
+    run_id = request.query.get("run_id", "")
+    if not run_id:
+        return web.json_response({"error": "Missing run_id"}, status=400)
+
+    with _CAPTURE_LOCK:
+        pending = _PENDING_CAPTURES.get(run_id)
+    if pending is None:
+        return web.json_response({"error": "Unknown or expired capture request"}, status=404)
+
+    try:
+        payload = await request.json()
+        if payload.get("error"):
+            raise RuntimeError(str(payload["error"]))
+        data_url = payload.get("image", "")
+        if not isinstance(data_url, str) or not data_url.startswith("data:image/png;base64,"):
+            raise ValueError("Expected a PNG data URL")
+        encoded = data_url.split(",", 1)[1]
+        image_bytes = base64.b64decode(encoded, validate=True)
+        if not image_bytes or len(image_bytes) > 64 * 1024 * 1024:
+            raise ValueError("PNG payload is empty or exceeds the 64 MB limit")
+        if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Invalid PNG data")
+
+        with _CAPTURE_LOCK:
+            current = _PENDING_CAPTURES.get(run_id)
+            if current is None:
+                return web.json_response({"error": "Capture request expired"}, status=410)
+            current["image_bytes"] = image_bytes
+            current["event"].set()
+        return web.json_response({"received": True})
+    except Exception as exc:
+        with _CAPTURE_LOCK:
+            current = _PENDING_CAPTURES.get(run_id)
+            if current is not None:
+                current["error"] = str(exc)
+                current["event"].set()
+        return web.json_response({"error": str(exc)}, status=400)
+
+
+# Register the upload endpoint once when this custom-node module is imported.
+try:
+    PromptServer.instance.routes.post("/sharp_gaussian_stereo/capture")(_receive_capture)
+except Exception as _route_error:
+    # ComfyUI may reload custom-node modules during development. Avoid making a
+    # duplicate-route warning fatal; the existing route remains registered.
+    print(f"[Gaussian Stereo] Capture route registration note: {_route_error}")
 
 
 class GaussianStereoPreview:
@@ -161,7 +223,8 @@ class SharpGaussianStereoPreview(GaussianStereoPreview):
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ()
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
     FUNCTION = "run"
     CATEGORY = "utils/preview"
     OUTPUT_NODE = True
@@ -171,13 +234,41 @@ class SharpGaussianStereoPreview(GaussianStereoPreview):
                    save_to_output=True, extrinsics=None, intrinsics=None, unique_id=None):
         return float("nan")
 
+    @staticmethod
+    def _send_capture_request(run_id, node_id, path, extrinsics_data, intrinsics_data):
+        PromptServer.instance.send_sync("sharp_gaussian_capture_request", {
+            "run_id": run_id,
+            "node_id": str(node_id),
+            "ply_file": str(path),
+            "filename": path.name,
+            "extrinsics": extrinsics_data,
+            "intrinsics": intrinsics_data,
+        })
+
+    @staticmethod
+    def _decode_capture(image_bytes):
+        with Image.open(BytesIO(image_bytes)) as pil_image:
+            rgb = pil_image.convert("RGB")
+            array = np.asarray(rgb, dtype=np.uint8).copy()
+        tensor = torch.from_numpy(array).to(dtype=torch.float32).div_(255.0)
+        return tensor.unsqueeze(0)
+
     def run(self, model, image, focal_length_mm=30.0,
             save_to_output=True, extrinsics=None, intrinsics=None, unique_id=None):
+        if getattr(image, "ndim", None) != 4:
+            raise ValueError("Expected IMAGE tensor with shape [B,H,W,C]")
+        if image.shape[0] != 1:
+            raise ValueError("SHARP Gaussian Stereo Preview currently supports one image per run")
+        if unique_id is None:
+            raise RuntimeError("ComfyUI did not provide the preview node ID; cannot request the browser capture")
+
+        run_id = uuid.uuid4().hex
+        capture_event = threading.Event()
+        pending = {"event": capture_event, "image_bytes": None, "error": None}
+        with _CAPTURE_LOCK:
+            _PENDING_CAPTURES[run_id] = pending
+
         try:
-            if getattr(image, "ndim", None) != 4:
-                raise ValueError("Expected IMAGE tensor with shape [B,H,W,C]")
-            if image.shape[0] != 1:
-                raise ValueError("SHARP Gaussian Stereo Preview currently supports one image per run")
             output_dir = (folder_paths.get_output_directory() if save_to_output
                           else folder_paths.get_temp_directory())
             Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -187,7 +278,7 @@ class SharpGaussianStereoPreview(GaussianStereoPreview):
                 focal_length_mm=focal_length_mm, extrinsics=extrinsics, intrinsics=intrinsics,
             )
             path = self._resolve_ply_path(ply_value)
-            if not save_to_output and unique_id is not None:
+            if not save_to_output:
                 node_key = str(unique_id)
                 temp_root = Path(folder_paths.get_temp_directory()).resolve()
                 with _TEMP_PLY_LOCK:
@@ -202,8 +293,24 @@ class SharpGaussianStereoPreview(GaussianStereoPreview):
                         except OSError as cleanup_error:
                             print(f"[Gaussian Stereo] Could not remove previous temp PLY {previous}: {cleanup_error}")
                     _TEMP_PLY_BY_NODE[node_key] = path
+
             extrinsics_data = self._validate_matrix(sharp_extrinsics, "extrinsics", 4, 4)
             intrinsics_data = self._validate_matrix(sharp_intrinsics, "intrinsics", 3, 3)
+
+            # Ask the browser viewer to load this run's PLY and capture its initial
+            # composed canvas. The node waits on a worker thread, not the aiohttp loop.
+            self._send_capture_request(run_id, unique_id, path, extrinsics_data, intrinsics_data)
+            if not capture_event.wait(_CAPTURE_TIMEOUT_SECONDS):
+                raise TimeoutError(
+                    "Timed out waiting for the browser viewer to produce the initial stereo image. "
+                    "Make sure the ComfyUI browser tab is open and the preview node is visible."
+                )
+            if pending["error"]:
+                raise RuntimeError(f"Browser capture failed: {pending['error']}")
+            if not pending["image_bytes"]:
+                raise RuntimeError("Browser capture completed without returning an image")
+
+            output_image = self._decode_capture(pending["image_bytes"])
             ui_data = {
                 "ply_file": [str(path)],
                 "filename": [path.name],
@@ -214,9 +321,11 @@ class SharpGaussianStereoPreview(GaussianStereoPreview):
                 ui_data["extrinsics"] = [extrinsics_data]
             if intrinsics_data is not None:
                 ui_data["intrinsics"] = [intrinsics_data]
-            return {"ui": ui_data, "result": ()}
-        except Exception as exc:
-            return {"ui": {"error": [str(exc)]}, "result": ()}
+            return {"ui": ui_data, "result": (output_image,)}
+        finally:
+            with _CAPTURE_LOCK:
+                _PENDING_CAPTURES.pop(run_id, None)
+
 
 
 from .sharp_model import LoadSharpModel
